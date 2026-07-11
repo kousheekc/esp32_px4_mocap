@@ -19,7 +19,7 @@ fn flip_about_x() -> UnitQuaternion<f32> {
 /// Motive pose -> PX4 NED pose
 /// Position: rotate by the change of basis
 /// Orientation: change of basis by conjugation, q_ned = r q r^-1
-pub fn transform_motive_to_ned(pos: [f32; 3], quat_xyzw: [f32; 4]) -> Pose {
+pub fn transform_pose(pos: [f32; 3], quat_xyzw: [f32; 4]) -> Pose {
     let r = flip_about_x();
     let p = r * Vector3::from(pos);
     let q = Quaternion::new(quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]);
@@ -48,13 +48,13 @@ mod tests {
 
     #[test]
     fn position_mapping() {
-        let ned = transform_motive_to_ned([1.0, 2.0, 3.0], [0.0, 0.0, 0.0, 1.0]);
+        let ned = transform_pose([1.0, 2.0, 3.0], [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(ned.pos, [1.0, -2.0, -3.0]);
     }
 
     #[test]
     fn quaternion_mapping() {
-        let ned = transform_motive_to_ned([0.0; 3], [0.1, 0.2, 0.3, 0.4]);
+        let ned = transform_pose([0.0; 3], [0.1, 0.2, 0.3, 0.4]);
         assert_eq!(ned.q, [0.4, 0.1, -0.2, -0.3]);
     }
 
@@ -63,7 +63,7 @@ mod tests {
         // 90 deg about Motive Z -> yaw = -90 deg.
         let s = FRAC_PI_4.sin();
         let c = FRAC_PI_4.cos();
-        let ned = transform_motive_to_ned([0.0; 3], [0.0, 0.0, s, c]);
+        let ned = transform_pose([0.0; 3], [0.0, 0.0, s, c]);
         let (r, p, y) = quat_to_euler_frd(ned.q);
         assert_near(r, 0.0, "roll");
         assert_near(p, 0.0, "pitch");
@@ -75,7 +75,7 @@ mod tests {
         // 90 deg about X -> roll = 90 deg.
         let s = FRAC_PI_4.sin();
         let c = FRAC_PI_4.cos();
-        let ned = transform_motive_to_ned([0.0; 3], [s, 0.0, 0.0, c]);
+        let ned = transform_pose([0.0; 3], [s, 0.0, 0.0, c]);
         let (r, p, y) = quat_to_euler_frd(ned.q);
         assert_near(r, FRAC_PI_2, "roll");
         assert_near(p, 0.0, "pitch");
