@@ -4,5 +4,5 @@ extern crate alloc;
 
 pub mod button;
 pub mod config;
-pub mod portal;
+pub mod server;
 pub mod store;

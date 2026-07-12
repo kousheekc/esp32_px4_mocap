@@ -175,27 +175,27 @@ async fn handle_connection(
         ("GET", "/") => {
             let current = store.lock().await.load().unwrap_or_default();
             page.clear();
-            settings::html::render_page(&current, None, page).map_err(|_| "page too large")?;
+            portal::html::render_page(&current, None, page).map_err(|_| "page too large")?;
             write_response(socket, "200 OK", page.as_str()).await?;
             Ok(false)
         }
         ("POST", "/save") => {
             let mut new = store.lock().await.load().unwrap_or_default();
-            let result = match settings::form::apply_form(&mut new, body) {
+            let result = match portal::form::apply_form(&mut new, body) {
                 Ok(()) => store.lock().await.save(&new),
                 Err(e) => Err(e),
             };
             match result {
                 Ok(()) => {
                     page.clear();
-                    settings::html::render_reboot_page(page).map_err(|_| "page too large")?;
+                    portal::html::render_reboot_page(page).map_err(|_| "page too large")?;
                     write_response(socket, "200 OK", page.as_str()).await?;
                     Ok(true)
                 }
                 Err(e) => {
                     warn!("portal: rejected settings ({e})");
                     page.clear();
-                    settings::html::render_page(&new, Some(e), page)
+                    portal::html::render_page(&new, Some(e), page)
                         .map_err(|_| "page too large")?;
                     write_response(socket, "200 OK", page.as_str()).await?;
                     Ok(false)

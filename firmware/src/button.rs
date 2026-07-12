@@ -1,4 +1,4 @@
-//! Factory reset: hold the BOOT button for 3 seconds to reset the settings.
+//! Factory reset hold the BOOT button for 3 seconds to reset the settings
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;

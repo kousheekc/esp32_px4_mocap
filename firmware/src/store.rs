@@ -6,7 +6,7 @@ use esp_bootloader_esp_idf::partitions::{
 use esp_hal::peripherals::FLASH;
 use esp_storage::FlashStorage;
 use log::{error, info};
-use settings::{Settings, WIRE_LEN};
+use portal::{Settings, WIRE_LEN};
 
 pub struct FlashStore {
     flash: FlashStorage<'static>,
