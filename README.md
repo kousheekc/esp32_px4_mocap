@@ -10,7 +10,7 @@
 ![MAVLink](https://img.shields.io/badge/protocol-MAVLink%20v2-brightgreen)
 ![License](https://img.shields.io/badge/license-BSD--3--Clause-green)
 
-Bare-metal Rust firmware for an ESP32 that streams mocap rigid body poses to a flight controller over MAVLink. You can watch a working example here with a Pixhawk 6C mini on a X500 quadcopter: [https://youtu.be/TODO](https://youtu.be/TODO)
+Bare-metal Rust firmware for an ESP32 that streams mocap rigid body poses to a flight controller over MAVLink. You can watch a working example here with a Pixhawk 6X on a X500 quadcopter:
 
 The bridge receives motion capture rigid body poses over WiFi, transforms them appropriately, and streams them over UART as MAVLink `VISION_POSITION_ESTIMATE` messages for external-vision fusion in the flight controller. This gives you a plug-and-play module, with no major electrical or mechanical changes to your airframe without the need for a full companion computer on the drone just to forward poses.
 
