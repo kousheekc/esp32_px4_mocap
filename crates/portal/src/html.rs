@@ -89,7 +89,7 @@ pub fn render_reboot_page(out: &mut impl Write) -> fmt::Result {
          <h1>Settings saved</h1>\
          <p>The bridge is restarting and will now connect to your network. \
          This access point will disappear.</p>\
-         <p>To change settings later, hold the BOOT button for 3 seconds — the \
+         <p>To change settings later, hold the BOOT button for 3 seconds then the \
          device returns to setup mode with default settings.</p></body></html>",
     )
 }
