@@ -9,6 +9,23 @@ name = "firmware"
 path = "./src/bin/main.rs"
 
 [dependencies]
+natnet   = { path = "../crates/natnet" }
+frames   = { path = "../crates/frames" }
+mavbridge  = { path = "../crates/mavbridge" }
+portal = { path = "../crates/portal" }
+
+heapless = { version = "0.9.3", default-features = false }
+
+# For use settings persistence in the NVS flash partition.
+esp-storage = { version = "0.9.0", features = ["esp32c6"] }
+embedded-storage = "0.3.1"
+
+# For portal and AP mode
+edge-dhcp = "0.8.0"
+edge-captive = "0.8.0"
+edge-nal = { version = "0.7.0", default-features = false }
+edge-nal-embassy = "0.8.1"
+
 esp-hal = { version = "~1.1.0", features = ["esp32c6", "log-04", "unstable"] }
 
 esp-rtos = { version = "0.3.0", features = [
@@ -26,9 +43,11 @@ embassy-net = { version = "0.9.1", features = [
   "dhcpv4",
   "log",
   "medium-ethernet",
+  "multicast",
   "tcp",
   "udp",
 ] }
+embassy-sync = "0.8.0"
 embedded-io = "0.7.1"
 embedded-io-async = "0.7.0"
 esp-alloc = "0.10.0"
@@ -71,6 +90,9 @@ static_cell      = "2.1.1"
 # The default debug profile is too slow and too big for resource-constrained devices.
 # Always build with some optimizations enabled.
 opt-level = "s"
+
+[profile.dev.package.esp-storage]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1     # LLVM can perform better optimizations using a single thread
