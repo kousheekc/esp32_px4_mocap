@@ -1141,6 +1141,7 @@ dependencies = [
  "edge-nal",
  "edge-nal-embassy",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-sync 0.8.0",
  "embassy-time",
@@ -1161,6 +1162,7 @@ dependencies = [
  "mavbridge",
  "natnet",
  "portal",
+ "qtmrt",
  "smoltcp",
  "static_cell",
 ]
@@ -1721,6 +1723,10 @@ checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "qtmrt"
+version = "0.1.0"
 
 [[package]]
 name = "quick-xml"

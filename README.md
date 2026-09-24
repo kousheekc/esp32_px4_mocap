@@ -24,7 +24,8 @@ https://github.com/user-attachments/assets/ee866f0b-1d2e-4d50-8783-3c1a3e9491da
 
 - **Bare-metal Rust** on the ESP32-C6 (`no_std`, [esp-hal](https://github.com/esp-rs/esp-hal) + [Embassy](https://embassy.dev/) async)
 - **Tracking-loss safety** - stops streaming when the rigid body goes stale so EKF2 coasts instead of fusing garbage, and increments the MAVLink `reset_counter` on reacquisition
-- **WiFi setup portal** - setup portal with a web form for WiFi credentials, NatNet, and MAVLink settings, persisted to flash
+- **OptiTrack and Qualisys** - receives NatNet multicast from Motive or the QTM real-time protocol from Qualisys Track Manager
+- **WiFi setup portal** - setup portal with a web form for WiFi credentials, mocap source, and MAVLink settings, persisted to flash
 - **Factory reset** - hold the BOOT button for 3 seconds to wipe settings and return to the portal
 
 ## How it works
@@ -32,7 +33,7 @@ https://github.com/user-attachments/assets/ee866f0b-1d2e-4d50-8783-3c1a3e9491da
 
 The firmware boots into one of two modes:
 
-- **Bridge mode** - when valid settings exist in flash: joins your WiFi as a client, subscribes to the multicast group, and streams `VISION_POSITION_ESTIMATE` (default 100 Hz) plus `HEARTBEAT` (1 Hz) over UART.
+- **Bridge mode** - when valid settings exist in flash: joins your WiFi as a client, subscribes to the NatNet multicast group (OptiTrack) or opens a QTM real-time session (Qualisys), and streams `VISION_POSITION_ESTIMATE` (default 100 Hz) plus `HEARTBEAT` (1 Hz) over UART.
 - **Portal mode** - on first boot or after a factory reset: starts a WiFi access point with a setup portal through a web browser.
 
 ## Getting started
@@ -44,8 +45,8 @@ Hardware:
 - An **ESP32-C6** development board (any board with USB flashing works)
 - A **PX4 flight controller** with a free UART/telemetry port (e.g. `TELEM2`)
 - 4 x **jumper wires** (TX, RX, GND, 5V) both sides are 3.3 V logic, no level shifter needed
-- An **OptiTrack** system running **Motive** with a tracked rigid body
-- A **2.4 GHz WiFi network** on the same LAN as the Motive PC
+- An **OptiTrack** system running **Motive**, or a **Qualisys** system running **QTM**, with a tracked rigid body
+- A **2.4 GHz WiFi network** on the same LAN as the mocap PC
 
 Software:
 
@@ -84,11 +85,14 @@ On a fresh flash (or after a factory reset) the bridge starts its own WiFi acces
 
 | Setting | Default | Notes |
 |---|---|---|
-| WiFi SSID / password | — | Your 2.4 GHz network, shared with the Motive PC |
-| Multicast address | `239.255.42.99` | Motive's default interface |
-| Data port | `1511` | Motive's default data port |
-| NatNet version | `3.1` | Match Motive's *Streaming* pane (2.x–4.x supported) |
-| Rigid body ID | `32` | The *Streaming ID* of your rigid body in Motive |
+| WiFi SSID / password | — | Your 2.4 GHz network, shared with the mocap PC |
+| Source | OptiTrack | OptiTrack (NatNet) or Qualisys (QTM) |
+| Rigid body | `32` | OptiTrack: the *Streaming ID* in Motive. Qualisys: position in QTM's 6DOF body list (1 = first) |
+| Multicast address | `239.255.42.99` | OptiTrack only: Motive's default interface |
+| Data port | `1511` | OptiTrack only: Motive's default data port |
+| NatNet version | `3.1` | OptiTrack only: match Motive's *Streaming* pane (2.x–4.x supported) |
+| QTM PC address | `192.168.1.100` | Qualisys only: IP of the PC running QTM |
+| RT port | `22223` | Qualisys only: QTM's little-endian real-time port |
 | MAVLink sysid / compid | `1` / `197` | 197 = vision/odometry source |
 | UART baud | `921600` | Must match the FC serial port baud |
 | VPE rate | `100 Hz` | `VISION_POSITION_ESTIMATE` transmit rate |
@@ -118,6 +122,15 @@ In Motive's **Streaming** pane:
 
 Once the bridge connects, the serial monitor logs the incoming packet rate and the latest pose once per second.
 
+### 3b. Set up QTM real-time output (Qualisys)
+
+Use this instead of step 3 when the source is Qualisys:
+
+1. Make sure QTM's real-time server is enabled (*Project Options → Processing → Real-Time Output*) and allowed through the Windows firewall (TCP 22223, and UDP out to the bridge).
+2. Define your rigid body under *6DOF Tracking* and note its position in the list, enter that as the rigid body number in the portal.
+3. Keep QTM's global coordinate system Z-up (the default); the bridge converts Z-up to PX4's NED frame.
+4. Start a measurement (or real-time preview). The bridge connects to QTM over TCP, requests 6DOF frames at the VPE rate over UDP (local port `22230`), and reconnects automatically if QTM restarts.
+
 ### 4. PX4 setup
 
 On the PX4 side (via QGroundControl parameters):
@@ -144,7 +157,7 @@ See the PX4 [External Position Estimation](https://docs.px4.io/main/en/ros/exter
 
 Planned extensions, roughly in order:
 
-- [ ] **Qualisys support** - add a QTM real-time protocol receiver alongside NatNet, so the bridge works with Qualisys mocap systems.
+- [x] **Qualisys support** - QTM real-time protocol receiver alongside NatNet.
 - [ ] **ArduPilot support** - ArduPilot accepts the same `VISION_POSITION_ESTIMATE` message, so add the corresponding setup documentation and any protocol tweaks needed for its external-navigation EKF sources.
 
 Contributions toward either are very welcome.

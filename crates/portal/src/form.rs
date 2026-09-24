@@ -1,11 +1,11 @@
 //! urlencoded form parsing for the portal form: bytes in, `Settings` out
 
-use crate::Settings;
+use crate::{MocapSource, Settings};
 use heapless::{String, Vec};
 
 pub const FIELD_KEYS: &[&str] = &[
-    "ssid", "pass", "mcast", "port", "nn_major", "nn_minor", "rbid", "sysid", "compid", "baud",
-    "vpe_hz", "hb_hz", "timeout_ms",
+    "ssid", "pass", "source", "mcast", "port", "nn_major", "nn_minor", "qtm_host", "qtm_port",
+    "rbid", "sysid", "compid", "baud", "vpe_hz", "hb_hz", "timeout_ms",
 ];
 
 pub fn apply_form(s: &mut Settings, body: &[u8]) -> Result<(), &'static str> {
@@ -25,7 +25,16 @@ pub fn apply_form(s: &mut Settings, body: &[u8]) -> Result<(), &'static str> {
         match key {
             "ssid" => s.wifi_ssid = string_field(value, "SSID too long (max 32)")?,
             "pass" => s.wifi_pass = string_field(value, "password too long (max 64)")?,
+            "source" => {
+                s.source = match value {
+                    "natnet" => MocapSource::NatNet,
+                    "qtm" => MocapSource::Qtm,
+                    _ => return Err("unknown mocap source"),
+                }
+            }
             "mcast" => s.multicast_addr = parse_dotted_quad(value)?,
+            "qtm_host" => s.qtm_host = parse_dotted_quad(value)?,
+            "qtm_port" => s.qtm_port = int_field(value, "QTM port")?,
             "port" => s.data_port = int_field(value, "data port")?,
             "nn_major" => s.natnet_major = int_field(value, "NatNet major")?,
             "nn_minor" => s.natnet_minor = int_field(value, "NatNet minor")?,
@@ -86,12 +95,32 @@ fn parse_dotted_quad(value: &str) -> Result<[u8; 4], &'static str> {
     for slot in &mut out {
         *slot = parts
             .next()
-            .ok_or("multicast address needs 4 octets")?
+            .ok_or("IP address needs 4 octets")?
             .parse()
-            .map_err(|_| "multicast octet is not 0-255")?;
+            .map_err(|_| "IP address octet is not 0-255")?;
     }
     if parts.next().is_some() {
-        return Err("multicast address needs exactly 4 octets");
+        return Err("IP address needs exactly 4 octets");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_qtm() {
+        let mut s = Settings::default();
+        apply_form(&mut s, b"source=qtm&qtm_host=10.0.0.5&qtm_port=22223&rbid=1").unwrap();
+        assert_eq!(s.source, MocapSource::Qtm);
+        assert_eq!(s.qtm_host, [10, 0, 0, 5]);
+        assert_eq!(s.rigid_body_id, 1);
+    }
+
+    #[test]
+    fn rejects_qtm_body_zero() {
+        let mut s = Settings::default();
+        assert!(apply_form(&mut s, b"source=qtm&rbid=0").is_err());
+    }
 }

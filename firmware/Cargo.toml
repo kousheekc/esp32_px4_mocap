@@ -10,6 +10,7 @@ path = "./src/bin/main.rs"
 
 [dependencies]
 natnet   = { path = "../crates/natnet" }
+qtmrt    = { path = "../crates/qtmrt" }
 frames   = { path = "../crates/frames" }
 mavbridge  = { path = "../crates/mavbridge" }
 portal = { path = "../crates/portal" }
@@ -48,6 +49,7 @@ embassy-net = { version = "0.9.1", features = [
   "udp",
 ] }
 embassy-sync = "0.8.0"
+embassy-futures = "0.1.2"
 embedded-io = "0.7.1"
 embedded-io-async = "0.7.0"
 esp-alloc = "0.10.0"

@@ -1,8 +1,18 @@
-//! Motive -> PX4 frame conversion
+//! Mocap (Z-up) -> PX4 frame conversion
 
 #![cfg_attr(not(test), no_std)]
 
-use nalgebra::{Quaternion, UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Quaternion, Rotation3, UnitQuaternion, Vector3};
+
+/// Rigid body pose from any mocap source, in its Z-up world frame
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sample {
+    /// Position (metres)
+    pub pos: [f32; 3],
+    /// Orientation `[x, y, z, w]`
+    pub quat_xyzw: [f32; 4],
+    pub valid: bool,
+}
 
 /// Pose in PX4 NED. `pos` is [x, y, z] (metres); `q` is `[w, x, y, z]`
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,6 +38,13 @@ pub fn transform_pose(pos: [f32; 3], quat_xyzw: [f32; 4]) -> Pose {
         pos: [p.x, p.y, p.z],
         q: [q_ned.w, q_ned.i, q_ned.j, q_ned.k],
     }
+}
+
+/// Column-major rotation matrix -> quaternion `[x, y, z, w]`
+pub fn rotmat_to_quat_xyzw(m: [f32; 9]) -> [f32; 4] {
+    let r = Rotation3::from_matrix_unchecked(Matrix3::from_column_slice(&m));
+    let q = UnitQuaternion::from_rotation_matrix(&r);
+    [q.i, q.j, q.k, q.w]
 }
 
 /// Quaternion `[w, x, y, z]` -> (roll, pitch, yaw) (radians)
@@ -95,6 +112,18 @@ mod tests {
         let c = FRAC_PI_4.cos();
         let (_, p, _) = quat_to_euler_frd([c, 0.0, s, 0.0]);
         assert!((p - FRAC_PI_2).abs() < 1e-3, "near-lock pitch: {p}");
+    }
+
+    #[test]
+    fn rotmat_z_rotation_negative_yaw() {
+        // 90 deg about Z, column-major: columns are the rotated X and Y axes.
+        let m = [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let q = rotmat_to_quat_xyzw(m);
+        let s = FRAC_PI_4.sin();
+        assert_near(q[2], s, "qz");
+        assert_near(q[3], s, "qw");
+        let (_, _, y) = quat_to_euler_frd(transform_pose([0.0; 3], q).q);
+        assert_near(y, -FRAC_PI_2, "yaw");
     }
 
 }

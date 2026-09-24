@@ -21,7 +21,13 @@
 //! | 124    | 2    | heartbeat rate (Hz)         |
 //! | 126    | 2    | reserved (0)                |
 //! | 128    | 4    | tracking timeout (ms)       |
-//! | 132    | 4    | CRC32 (IEEE) of bytes 0..132|
+//! | 132    | 1    | source (0 NatNet, 1 QTM)    |
+//! | 133    | 1    | reserved (0)                |
+//! | 134    | 2    | QTM port                    |
+//! | 136    | 4    | QTM host address            |
+//! | 140    | 4    | CRC32 (IEEE) of bytes 0..140|
+//!
+//! Version 1 is the same up to byte 132, where its CRC sits; it loads with QTM defaults.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -31,9 +37,36 @@ pub mod html;
 use heapless::String;
 
 const MAGIC: &[u8; 4] = b"MCFG";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
+const V1_LEN: usize = 136;
 
-pub const WIRE_LEN: usize = 136;
+pub const WIRE_LEN: usize = 144;
+
+/// Where poses come from
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MocapSource {
+    /// OptiTrack Motive, NatNet multicast
+    NatNet,
+    /// Qualisys QTM, RT protocol
+    Qtm,
+}
+
+impl MocapSource {
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::NatNet),
+            1 => Some(Self::Qtm),
+            _ => None,
+        }
+    }
+
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::NatNet => 0,
+            Self::Qtm => 1,
+        }
+    }
+}
 
 /// User-configurable settings
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +75,8 @@ pub struct Settings {
     pub wifi_ssid: String<32>,
     /// WPA2 passphrase (<= 64 bytes)
     pub wifi_pass: String<64>,
+    /// Mocap system
+    pub source: MocapSource,
     /// NatNet multicast group (Motive default 239.255.42.99)
     pub multicast_addr: [u8; 4],
     /// NatNet data port (Motive default 1511)
@@ -49,8 +84,12 @@ pub struct Settings {
     /// NatNet protocol version
     pub natnet_major: u8,
     pub natnet_minor: u8,
-    /// Rigid body id
+    /// NatNet streaming id, or 1-based QTM 6D body number
     pub rigid_body_id: i32,
+    /// QTM PC address
+    pub qtm_host: [u8; 4],
+    /// QTM RT port (little-endian protocol)
+    pub qtm_port: u16,
     /// MAVLink identity (compid 197 = vision/odometry source)
     pub mav_sysid: u8,
     pub mav_compid: u8,
@@ -69,11 +108,14 @@ impl Default for Settings {
         Self {
             wifi_ssid: String::try_from("mocap-wifi").unwrap(),
             wifi_pass: String::try_from("mocap-password").unwrap(),
+            source: MocapSource::NatNet,
             multicast_addr: [239, 255, 42, 99],
             data_port: 1511,
             natnet_major: 3,
             natnet_minor: 1,
             rigid_body_id: 32,
+            qtm_host: [192, 168, 1, 100],
+            qtm_port: 22223,
             mav_sysid: 1,
             mav_compid: 197,
             mavlink_baud: 921_600,
@@ -89,14 +131,29 @@ impl Settings {
         if self.wifi_ssid.is_empty() {
             return Err("WiFi SSID must not be empty");
         }
-        if !(224..=239).contains(&self.multicast_addr[0]) {
-            return Err("multicast address must be in 224.0.0.0/4");
-        }
-        if self.data_port == 0 {
-            return Err("data port must not be 0");
-        }
-        if !(2..=4).contains(&self.natnet_major) {
-            return Err("NatNet major version must be 2..=4");
+        match self.source {
+            MocapSource::NatNet => {
+                if !(224..=239).contains(&self.multicast_addr[0]) {
+                    return Err("multicast address must be in 224.0.0.0/4");
+                }
+                if self.data_port == 0 {
+                    return Err("data port must not be 0");
+                }
+                if !(2..=4).contains(&self.natnet_major) {
+                    return Err("NatNet major version must be 2..=4");
+                }
+            }
+            MocapSource::Qtm => {
+                if self.qtm_host[0] == 0 || self.qtm_host[0] >= 224 {
+                    return Err("QTM host must be a unicast address");
+                }
+                if self.qtm_port == 0 {
+                    return Err("QTM port must not be 0");
+                }
+                if self.rigid_body_id < 1 {
+                    return Err("QTM body number must be at least 1");
+                }
+            }
         }
         if !(9_600..=3_000_000).contains(&self.mavlink_baud) {
             return Err("baud must be within 9600..=3000000");
@@ -134,20 +191,25 @@ impl Settings {
         out[122..124].copy_from_slice(&self.vpe_rate_hz.to_le_bytes());
         out[124..126].copy_from_slice(&self.heartbeat_rate_hz.to_le_bytes());
         out[128..132].copy_from_slice(&self.track_timeout_ms.to_le_bytes());
+        out[132] = self.source.to_byte();
+        out[134..136].copy_from_slice(&self.qtm_port.to_le_bytes());
+        out[136..140].copy_from_slice(&self.qtm_host);
         let crc = crc32(&out[..WIRE_LEN - 4]);
-        out[132..136].copy_from_slice(&crc.to_le_bytes());
+        out[140..144].copy_from_slice(&crc.to_le_bytes());
     }
 
     pub fn from_bytes(data: &[u8]) -> Option<Settings> {
-        if data.len() < WIRE_LEN {
+        if data.len() < 5 || &data[0..4] != MAGIC {
             return None;
         }
-        let data = &data[..WIRE_LEN];
-        if &data[0..4] != MAGIC || data[4] != FORMAT_VERSION {
-            return None;
-        }
-        let crc_stored = u32::from_le_bytes(data[132..136].try_into().unwrap());
-        if crc32(&data[..WIRE_LEN - 4]) != crc_stored {
+        let len = match data[4] {
+            1 => V1_LEN,
+            FORMAT_VERSION => WIRE_LEN,
+            _ => return None,
+        };
+        let data = data.get(..len)?;
+        let crc_stored = u32::from_le_bytes(data[len - 4..].try_into().unwrap());
+        if crc32(&data[..len - 4]) != crc_stored {
             return None;
         }
         let ssid_len = data[5] as usize;
@@ -158,11 +220,26 @@ impl Settings {
         let s = Settings {
             wifi_ssid: str_from(&data[8..8 + ssid_len])?,
             wifi_pass: str_from(&data[40..40 + pass_len])?,
+            source: if len == WIRE_LEN {
+                MocapSource::from_byte(data[132])?
+            } else {
+                MocapSource::NatNet
+            },
             multicast_addr: data[104..108].try_into().unwrap(),
             data_port: u16::from_le_bytes(data[108..110].try_into().unwrap()),
             natnet_major: data[110],
             natnet_minor: data[111],
             rigid_body_id: i32::from_le_bytes(data[112..116].try_into().unwrap()),
+            qtm_host: if len == WIRE_LEN {
+                data[136..140].try_into().unwrap()
+            } else {
+                Settings::default().qtm_host
+            },
+            qtm_port: if len == WIRE_LEN {
+                u16::from_le_bytes(data[134..136].try_into().unwrap())
+            } else {
+                Settings::default().qtm_port
+            },
             mav_sysid: data[116],
             mav_compid: data[117],
             mavlink_baud: u32::from_le_bytes(data[118..122].try_into().unwrap()),
@@ -190,4 +267,41 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_qtm() {
+        let s = Settings {
+            source: MocapSource::Qtm,
+            qtm_host: [10, 0, 0, 5],
+            qtm_port: 22222,
+            rigid_body_id: 2,
+            ..Settings::default()
+        };
+        let mut buf = [0u8; WIRE_LEN];
+        s.to_bytes(&mut buf);
+        assert_eq!(Settings::from_bytes(&buf), Some(s));
+        buf[137] ^= 1;
+        assert_eq!(Settings::from_bytes(&buf), None);
+    }
+
+    #[test]
+    fn loads_v1_as_natnet() {
+        let s = Settings {
+            rigid_body_id: 7,
+            ..Settings::default()
+        };
+        let mut buf = [0u8; WIRE_LEN];
+        s.to_bytes(&mut buf);
+        // Rebuild as a v1 blob: version byte 1, CRC over 0..132 at 132.
+        buf[4] = 1;
+        let crc = crc32(&buf[..132]);
+        buf[132..136].copy_from_slice(&crc.to_le_bytes());
+        buf[136..].fill(0xFF);
+        assert_eq!(Settings::from_bytes(&buf), Some(s));
+    }
 }
