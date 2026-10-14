@@ -95,7 +95,7 @@ On a fresh flash (or after a factory reset) the bridge starts its own WiFi acces
 | RT port | `22223` | Qualisys only: QTM's little-endian real-time port |
 | MAVLink sysid / compid | `1` / `197` | 197 = vision/odometry source |
 | UART baud | `921600` | Must match the FC serial port baud |
-| VPE rate | `100 Hz` | `VISION_POSITION_ESTIMATE` transmit rate |
+| VPE rate | `100 Hz` | Qualisys: frame rate requested from QTM. Each received pose is forwarded as soon as it arrives, so the transmit rate follows the incoming stream (OptiTrack: Motive's streaming rate) |
 | Heartbeat rate | `1 Hz` | Must divide the VPE rate |
 | Tracking timeout | `200 ms` | Stop streaming after no valid pose for this long |
 
@@ -120,7 +120,7 @@ In Motive's **Streaming** pane:
 2. Select the network interface that is on the same LAN as your WiFi.
 3. Note the **Streaming ID** of your rigid body and enter it in the portal.
 
-Once the bridge connects, the serial monitor logs the incoming packet rate and the latest pose once per second.
+Once the bridge connects, the serial monitor logs the incoming packet rate, the number of `VISION_POSITION_ESTIMATE` messages sent, and the latest pose once per second.
 
 ### 3b. Set up QTM real-time output (Qualisys)
 
@@ -130,6 +130,7 @@ Use this instead of step 3 when the source is Qualisys:
 2. Define your rigid body under *6DOF Tracking* and note its position in the list, enter that as the rigid body number in the portal.
 3. Keep QTM's global coordinate system Z-up (the default); the bridge converts Z-up to PX4's NED frame.
 4. Start a measurement (or real-time preview). The bridge connects to QTM over TCP, requests 6DOF frames at the VPE rate over UDP (local port `22230`), and reconnects automatically if QTM restarts.
+5. The once-per-second serial log line reports `missed N (frame step S)`: QTM frames that never reached the bridge, judged from gaps in QTM's frame number (`S` is the normal step, capture rate / stream rate). Non-zero `missed` means frames are lost between QTM and the bridge, usually on the WiFi link.
 
 ### 4. PX4 setup
 
@@ -143,11 +144,17 @@ On the PX4 side (via QGroundControl parameters):
    - `EKF2_EV_CTRL` = `11` (horizontal position + vertical position + yaw)
    - `EKF2_HGT_REF` = `Vision`
    - For a pure indoor setup, disable GPS fusion: `EKF2_GPS_CTRL` = `0`
-   - Optionally tune `EKF2_EV_DELAY` to your mocap + WiFi latency
+   - Optionally tune `EKF2_EV_DELAY` to your mocap + WiFi latency (see *Timestamps* below)
 3. **Verify before flying:**
    - In QGroundControl's **MAVLink Inspector**, confirm `VISION_POSITION_ESTIMATE` is arriving at the configured rate.
    - Check `LOCAL_POSITION_NED` follows when you carry the vehicle around the arena, and that yaw matches reality
    - Cover the markers and confirm the bridge logs "tracking lost" and PX4 keeps a sane estimate.
+
+### Timestamps
+
+With Qualisys, each `VISION_POSITION_ESTIMATE` carries the frame's capture time rather than the time it was sent, so WiFi delivering frames late or in bursts doesn't change the timestamp PX4 sees. The bridge maps QTM's frame timestamps onto its own clock using the fastest-arriving recent packet, and answers PX4's `TIMESYNC` requests so PX4 can map the bridge clock onto its own. PX4 needs about 500 timesync exchanges (~50 s after boot) before it trusts the timestamps; until then it stamps messages on arrival, as it would without timesync. `EKF2_EV_DELAY` then only has to cover the fixed part of the latency (QTM processing and the fastest network transit). OptiTrack poses are still stamped on arrival at the bridge.
+
+The QTM serial log line also reports `dup N` (frames dropped because another QTM session was streaming the same frames to the bridge, e.g. one left over from before a reset), `age max` (the most any forwarded frame had aged since capture) and `timesync N` (replies sent to PX4 in the last second, ~10 when PX4's External Vision link is working).
 
 See the PX4 [External Position Estimation](https://docs.px4.io/main/en/ros/external_position_estimation.html) guide for background and tuning advice.
 

@@ -124,6 +124,68 @@ pub fn parse_packet(data: &[u8]) -> Option<Packet<'_>> {
     })
 }
 
+/// Capture timestamp and camera frame number at the start of every Data packet
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataHeader {
+    /// Capture time of the frame on QTM's clock (microseconds)
+    pub timestamp_us: u64,
+    pub frame: u32,
+}
+
+/// Parse the header of a Data packet payload
+pub fn data_header(payload: &[u8]) -> Option<DataHeader> {
+    let mut r = ByteReader::new(payload);
+    let t = r.take(8)?;
+    let timestamp_us = u64::from_le_bytes([t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]);
+    let frame = r.u32()?;
+    Some(DataHeader { timestamp_us, frame })
+}
+
+/// Maps QTM capture timestamps onto the local clock.
+///
+/// The offset is the smallest `arrival - capture` seen over the last 1-2 s, i.e. from the packet
+/// that crossed the network fastest, so packets that WiFi held back don't skew it. The window
+/// tracks slow clock drift; a timestamp going backwards (QTM restarted the measurement) resets it.
+pub struct ClockSync {
+    window_us: u64,
+    block_start_us: u64,
+    cur_min: i64,
+    prev_min: i64,
+    last_capture_us: Option<u64>,
+}
+
+impl ClockSync {
+    /// `window_us` is the length of each of the two blocks the minimum is taken over
+    pub const fn new(window_us: u64) -> Self {
+        Self {
+            window_us,
+            block_start_us: 0,
+            cur_min: 0,
+            prev_min: 0,
+            last_capture_us: None,
+        }
+    }
+
+    /// Feed one packet; returns its capture time on the local clock (never later than arrival)
+    pub fn update(&mut self, capture_us: u64, arrival_us: u64) -> u64 {
+        let d = arrival_us as i64 - capture_us as i64;
+        let restart = self.last_capture_us.is_none_or(|last| capture_us < last);
+        if restart {
+            self.cur_min = d;
+            self.prev_min = d;
+            self.block_start_us = arrival_us;
+        } else if arrival_us.saturating_sub(self.block_start_us) >= self.window_us {
+            self.prev_min = self.cur_min;
+            self.cur_min = d;
+            self.block_start_us = arrival_us;
+        } else {
+            self.cur_min = self.cur_min.min(d);
+        }
+        self.last_capture_us = Some(capture_us);
+        (capture_us as i64 + self.cur_min.min(self.prev_min)) as u64
+    }
+}
+
 /// Parse a Data packet payload, returning the 6D body at `index` (0-based), or `None` if it's
 /// malformed, has no 6D component, or has fewer bodies
 pub fn parse_6d(payload: &[u8], index: usize) -> Option<Body> {
@@ -231,6 +293,54 @@ mod tests {
         assert_eq!(b.rot, IDENTITY);
         assert!(b.valid);
         assert_eq!(parse_6d(&p, 2), None);
+    }
+
+    #[test]
+    fn reads_data_header() {
+        let p = data_payload(&[six_d(&[([1.0, 2.0, 3.0], IDENTITY)])]);
+        assert_eq!(
+            data_header(&p),
+            Some(DataHeader { timestamp_us: 123_456, frame: 42 })
+        );
+        assert_eq!(data_header(&p[..11]), None);
+    }
+
+    #[test]
+    fn clock_sync_uses_fastest_packet() {
+        // True offset 1_000_000 us; network latency 3 ms, but some packets held up to 80 ms.
+        let mut cs = ClockSync::new(1_000_000);
+        let latency = [3_000, 40_000, 80_000, 3_500, 3_000, 60_000];
+        let mut out = Vec::new();
+        for (i, l) in latency.iter().enumerate() {
+            let capture = 10_000 * i as u64;
+            out.push(cs.update(capture, capture + 1_000_000 + l));
+        }
+        // After the first packet every capture maps to capture + offset + 3 ms, however late
+        // the packet itself arrived.
+        for (i, &t) in out.iter().enumerate() {
+            assert_eq!(t, 10_000 * i as u64 + 1_003_000, "packet {i}");
+        }
+    }
+
+    #[test]
+    fn clock_sync_never_maps_after_arrival() {
+        let mut cs = ClockSync::new(1_000_000);
+        cs.update(0, 1_010_000);
+        assert!(cs.update(10_000, 1_015_000) <= 1_015_000);
+    }
+
+    #[test]
+    fn clock_sync_forgets_old_minimum_and_resets_on_restart() {
+        let mut cs = ClockSync::new(1_000_000);
+        cs.update(0, 1_003_000); // offset estimate 1_003_000
+        // 2.5 s later the path got 2 ms slower for good: old minimum ages out after two blocks.
+        for k in 1..=300 {
+            let capture = 10_000 * k;
+            cs.update(capture, capture + 1_005_000);
+        }
+        assert_eq!(cs.update(3_010_000, 4_015_000), 3_010_000 + 1_005_000);
+        // QTM restarts the measurement: timestamps start over.
+        assert_eq!(cs.update(0, 9_000_000), 9_000_000);
     }
 
     #[test]

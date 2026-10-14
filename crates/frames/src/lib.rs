@@ -12,6 +12,8 @@ pub struct Sample {
     /// Orientation `[x, y, z, w]`
     pub quat_xyzw: [f32; 4],
     pub valid: bool,
+    /// When the frame was captured, on the bridge's clock (microseconds since boot)
+    pub capture_us: u64,
 }
 
 /// Pose in PX4 NED. `pos` is [x, y, z] (metres); `q` is `[w, x, y, z]`

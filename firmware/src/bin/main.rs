@@ -16,17 +16,18 @@
 // In BOTH modes, holding BOOT (GPIO9) for 3 s erases settings and reboots back into the portal.
 
 use core::net::Ipv4Addr;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select3, select4, Either3, Either4};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{
     Config as NetConfig, IpAddress, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
-use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_io_async::{Read as _, Write as _};
 use esp_backtrace as _;
@@ -34,7 +35,7 @@ use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal::uart::{Config as UartConfig, Uart};
+use esp_hal::uart::{Config as UartConfig, RxConfig, Uart, UartRx, UartTx};
 use esp_hal::Async;
 use esp_radio::wifi::ap::AccessPointConfig;
 use esp_radio::wifi::sta::StationConfig;
@@ -43,14 +44,51 @@ use firmware::store::FlashStore;
 use firmware::{button, config, server};
 use frames::{quat_to_euler_frd, rotmat_to_quat_xyzw, transform_pose, Sample};
 use log::{info, warn};
-use mavbridge::{Encoder, MAX_FRAME_LEN};
+use mavbridge::{Decoder, Encoder, TimesyncRequest, MAX_FRAME_LEN};
 use portal::{MocapSource, Settings};
 use static_cell::StaticCell;
 
 extern crate alloc;
 
-/// Latest pose from the RX task to the TX loop.
-static POSE: Watch<CriticalSectionRawMutex, Sample, 1> = Watch::new();
+/// Every parsed pose from the RX task to the TX loop, so WiFi bursts are forwarded, not collapsed.
+static POSES: Channel<CriticalSectionRawMutex, Sample, 8> = Channel::new();
+/// VPE frames written to the UART since the RX task's last stats line.
+static VPE_SENT: AtomicU32 = AtomicU32::new(0);
+/// Poses dropped because the TX loop fell behind and the queue was full.
+static QUEUE_FULL: AtomicU32 = AtomicU32::new(0);
+/// TIMESYNC requests from the flight controller, answered by the TX loop.
+static TIMESYNC_REQS: Channel<CriticalSectionRawMutex, TimesyncRequest, 4> = Channel::new();
+/// TIMESYNC replies sent since the last stats line.
+static TIMESYNC_SENT: AtomicU32 = AtomicU32::new(0);
+/// Largest capture-to-send age of a VPE since the last stats line (microseconds).
+static MAX_AGE_US: AtomicU32 = AtomicU32::new(0);
+/// UART RX errors (mostly FIFO overflows) since the last stats line.
+static UART_RX_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+fn publish(sample: Sample) {
+    if POSES.try_send(sample).is_err() {
+        QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// TX-side counters for the once-per-second stats line; reading resets them.
+struct TxStats {
+    sent: u32,
+    queue_full: u32,
+    timesync: u32,
+    max_age_ms: u32,
+    uart_rx_errors: u32,
+}
+
+fn tx_stats() -> TxStats {
+    TxStats {
+        sent: VPE_SENT.swap(0, Ordering::Relaxed),
+        queue_full: QUEUE_FULL.swap(0, Ordering::Relaxed),
+        timesync: TIMESYNC_SENT.swap(0, Ordering::Relaxed),
+        max_age_ms: MAX_AGE_US.swap(0, Ordering::Relaxed) / 1000,
+        uart_rx_errors: UART_RX_ERRORS.swap(0, Ordering::Relaxed),
+    }
+}
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -124,14 +162,19 @@ async fn main(spawner: Spawner) -> ! {
 
             let uart = Uart::new(
                 peripherals.UART1,
-                UartConfig::default().with_baudrate(s.mavlink_baud),
+                // The FC streams telemetry at us; wake the RX task well before the 128 B FIFO fills.
+                UartConfig::default()
+                    .with_baudrate(s.mavlink_baud)
+                    .with_rx(RxConfig::default().with_fifo_full_threshold(32)),
             )
             .expect("UART init failed")
             .with_tx(peripherals.GPIO21)
             .with_rx(peripherals.GPIO2)
             .into_async();
+            let (uart_rx, uart_tx) = uart.split();
+            spawner.spawn(uart_rx_task(uart_rx).expect("uart rx task"));
 
-            run_bridge(s, uart).await
+            run_bridge(s, uart_tx).await
         }
 
         // PORTAL mode
@@ -169,11 +212,11 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
-/// TX loop: fresh valid pose -> NED -> VPE over UART
-async fn run_bridge(s: &'static Settings, mut uart: Uart<'static, Async>) -> ! {
+/// TX loop: each valid pose -> NED -> VPE over UART as soon as it arrives, plus heartbeat and
+/// TIMESYNC replies
+async fn run_bridge(s: &'static Settings, mut uart: UartTx<'static, Async>) -> ! {
     let mut encoder = Encoder::new(s.mav_sysid, s.mav_compid);
     let mut buf = [0u8; MAX_FRAME_LEN];
-    let mut pose_rx = POSE.receiver().expect("pose receiver");
 
     let track_timeout = Duration::from_millis(u64::from(s.track_timeout_ms));
     let mut tracking_active = false;
@@ -181,51 +224,102 @@ async fn run_bridge(s: &'static Settings, mut uart: Uart<'static, Async>) -> ! {
     let mut last_valid = Instant::now();
     let mut reset_counter: u8 = 0;
 
-    let ticks_per_heartbeat = u64::from(s.vpe_rate_hz / s.heartbeat_rate_hz);
-    let mut ticker = Ticker::every(Duration::from_hz(u64::from(s.vpe_rate_hz)));
-    let mut tick: u64 = 0;
+    let mut heartbeat = Ticker::every(Duration::from_hz(u64::from(s.heartbeat_rate_hz)));
 
     loop {
-        ticker.next().await;
-
-        if tick % ticks_per_heartbeat == 0 {
-            let n = encoder.heartbeat(&mut buf);
-            uart.write_all(&buf[..n]).await.expect("UART write failed");
-        }
-        tick += 1;
-
-        let now = Instant::now();
-
-        if let Some(rb) = pose_rx.try_changed().filter(|rb| rb.valid) {
-            // Recovered after a tracking gap -> tell EKF2 to reset vision fusion.
-            if !tracking_active {
-                if ever_tracked {
-                    reset_counter = reset_counter.wrapping_add(1);
-                }
-                tracking_active = true;
-                info!("tracking acquired (reset_counter={reset_counter})");
+        let tracking_deadline = async {
+            if tracking_active {
+                Timer::at(last_valid + track_timeout).await
+            } else {
+                core::future::pending::<()>().await
             }
-            ever_tracked = true;
-            last_valid = now;
+        };
 
-            let ned = transform_pose(rb.pos, rb.quat_xyzw);
-            let (roll, pitch, yaw) = quat_to_euler_frd(ned.q);
-            let n = encoder.vision_position_estimate(
-                &mut buf,
-                now.as_micros(),
-                ned.pos[0],
-                ned.pos[1],
-                ned.pos[2],
-                roll,
-                pitch,
-                yaw,
-                reset_counter,
-            );
-            uart.write_all(&buf[..n]).await.expect("UART write failed");
-        } else if tracking_active && now.duration_since(last_valid) > track_timeout {
-            // No fresh/valid pose for a while: stop sending, let EKF2 coast.
-            tracking_active = false;
-            info!("tracking lost (no valid pose for {} ms)", s.track_timeout_ms);
+        // TIMESYNC first: PX4 only uses replies that come back within 10 ms.
+        match select4(
+            TIMESYNC_REQS.receive(),
+            POSES.receive(),
+            heartbeat.next(),
+            tracking_deadline,
+        )
+        .await
+        {
+            Either4::First(req) => {
+                // Stamp at send time so the delay before sending isn't counted as clock offset.
+                let now_ns = Instant::now().as_micros() as i64 * 1000;
+                let n = encoder.timesync_reply(&mut buf, now_ns, &req);
+                uart.write_all(&buf[..n]).await.expect("UART write failed");
+                TIMESYNC_SENT.fetch_add(1, Ordering::Relaxed);
+            }
+            Either4::Second(rb) => {
+                // Invalid poses don't refresh last_valid, so the deadline still fires.
+                if !rb.valid {
+                    continue;
+                }
+                // Recovered after a tracking gap -> tell EKF2 to reset vision fusion.
+                if !tracking_active {
+                    if ever_tracked {
+                        reset_counter = reset_counter.wrapping_add(1);
+                    }
+                    tracking_active = true;
+                    info!("tracking acquired (reset_counter={reset_counter})");
+                }
+                ever_tracked = true;
+                let now = Instant::now();
+                last_valid = now;
+
+                let ned = transform_pose(rb.pos, rb.quat_xyzw);
+                let (roll, pitch, yaw) = quat_to_euler_frd(ned.q);
+                // Capture time, so PX4 (once timesynced) isn't fooled by WiFi delivering late.
+                let age_us = now.as_micros().saturating_sub(rb.capture_us);
+                MAX_AGE_US.fetch_max(age_us.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+                let n = encoder.vision_position_estimate(
+                    &mut buf,
+                    rb.capture_us,
+                    ned.pos[0],
+                    ned.pos[1],
+                    ned.pos[2],
+                    roll,
+                    pitch,
+                    yaw,
+                    reset_counter,
+                );
+                uart.write_all(&buf[..n]).await.expect("UART write failed");
+                VPE_SENT.fetch_add(1, Ordering::Relaxed);
+            }
+            Either4::Third(()) => {
+                let n = encoder.heartbeat(&mut buf);
+                uart.write_all(&buf[..n]).await.expect("UART write failed");
+            }
+            Either4::Fourth(()) => {
+                // No valid pose for a while: stop sending, let EKF2 coast.
+                tracking_active = false;
+                info!("tracking lost (no valid pose for {} ms)", s.track_timeout_ms);
+            }
+        }
+    }
+}
+
+/// UART RX: pick TIMESYNC requests out of the flight controller's MAVLink stream so PX4 can
+/// learn our clock and use the capture times we put in VISION_POSITION_ESTIMATE.
+#[embassy_executor::task]
+async fn uart_rx_task(mut uart: UartRx<'static, Async>) -> ! {
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 128];
+    loop {
+        match uart.read_async(&mut buf).await {
+            Ok(n) => {
+                for &b in &buf[..n] {
+                    if let Some(req) = decoder.push(b) {
+                        // Full queue means the TX loop is stalled; a missed request is harmless.
+                        let _ = TIMESYNC_REQS.try_send(req);
+                    }
+                }
+            }
+            // Counted, not logged: printing each one stalls the executor and causes more.
+            Err(_) => {
+                UART_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -298,10 +392,12 @@ async fn natnet_rx_task(stack: Stack<'static>, s: &'static Settings) -> ! {
                 pkts += 1;
                 last_len = len;
                 if let Some(rb) = natnet::parse_frame(&pkt[..len], version, s.rigid_body_id) {
-                    POSE.sender().send(Sample {
+                    publish(Sample {
                         pos: rb.pos,
                         quat_xyzw: rb.quat,
                         valid: rb.valid,
+                        // NatNet capture times aren't mapped yet: stamp on arrival.
+                        capture_us: Instant::now().as_micros(),
                     });
                     last_pose = Some(rb);
                 }
@@ -312,14 +408,15 @@ async fn natnet_rx_task(stack: Stack<'static>, s: &'static Settings) -> ! {
         let elapsed = window_start.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let hz = pkts as f32 / (elapsed.as_millis() as f32 / 1000.0);
+            let TxStats { sent, queue_full, timesync, uart_rx_errors, .. } = tx_stats();
             match last_pose.take() {
                 Some(rb) => info!(
-                    "natnet: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | rb{}: pos [{:.3} {:.3} {:.3}] quat [{:.3} {:.3} {:.3} {:.3}] valid={}",
+                    "natnet: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | sent {sent}, queue full {queue_full}, timesync {timesync}, uart rx err {uart_rx_errors} | rb{}: pos [{:.3} {:.3} {:.3}] quat [{:.3} {:.3} {:.3} {:.3}] valid={}",
                     rb.id, rb.pos[0], rb.pos[1], rb.pos[2],
                     rb.quat[0], rb.quat[1], rb.quat[2], rb.quat[3], rb.valid
                 ),
                 None => info!(
-                    "natnet: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | rb{} not seen",
+                    "natnet: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | sent {sent}, queue full {queue_full}, timesync {timesync}, uart rx err {uart_rx_errors} | rb{} not seen",
                     s.rigid_body_id
                 ),
             }
@@ -416,6 +513,13 @@ async fn qtm_session(
     let mut pkts: u32 = 0;
     let mut last_len = 0usize;
     let mut last_pose: Option<qtmrt::Body> = None;
+    // QTM frame numbers count camera frames, so the normal step is capture rate / stream rate.
+    // Take the smallest step seen as normal and count anything larger as missed frames.
+    let mut last_frame: Option<u32> = None;
+    let mut frame_step: Option<u32> = None;
+    let mut missed: u32 = 0;
+    let mut dup: u32 = 0;
+    let mut clock = qtmrt::ClockSync::new(1_000_000);
 
     loop {
         match select3(
@@ -435,7 +539,8 @@ async fn qtm_session(
                 Err(e) => return e,
             },
             Either3::Second(Ok((len, _meta))) => {
-                last_data = Instant::now();
+                let arrival = Instant::now();
+                last_data = arrival;
                 pkts += 1;
                 last_len = len;
                 let Some(p) = qtmrt::parse_packet(&pkt[..len]) else {
@@ -444,13 +549,37 @@ async fn qtm_session(
                 if p.kind != qtmrt::PacketType::Data {
                     continue;
                 }
-                if let Some(rb) = qtmrt::parse_6d(p.payload, index) {
-                    POSE.sender().send(Sample {
-                        pos: rb.pos.map(|v| v * 1e-3),
-                        quat_xyzw: rotmat_to_quat_xyzw(rb.rot),
-                        valid: rb.valid,
-                    });
-                    last_pose = Some(rb);
+                let Some(hdr) = qtmrt::data_header(p.payload) else {
+                    continue;
+                };
+                // Sessions QTM still holds from before a bridge reset stream the same frames to
+                // this port again, so only forward frames newer than the last one.
+                let fresh = match last_frame.map(|prev| hdr.frame.wrapping_sub(prev) as i32) {
+                    Some(d) if (-1000..=0).contains(&d) => false,
+                    Some(d) if d > 0 && d < 100_000 => {
+                        let step = d as u32;
+                        let normal = frame_step.map_or(step, |n| n.min(step));
+                        frame_step = Some(normal);
+                        missed += (step / normal).saturating_sub(1);
+                        true
+                    }
+                    // First frame, or QTM restarted the measurement.
+                    _ => true,
+                };
+                if !fresh {
+                    dup += 1;
+                } else {
+                    last_frame = Some(hdr.frame);
+                    let capture_us = clock.update(hdr.timestamp_us, arrival.as_micros());
+                    if let Some(rb) = qtmrt::parse_6d(p.payload, index) {
+                        publish(Sample {
+                            pos: rb.pos.map(|v| v * 1e-3),
+                            quat_xyzw: rotmat_to_quat_xyzw(rb.rot),
+                            valid: rb.valid,
+                            capture_us,
+                        });
+                        last_pose = Some(rb);
+                    }
                 }
             }
             Either3::Second(Err(e)) => warn!("qtm: recv error {e:?}"),
@@ -467,16 +596,20 @@ async fn qtm_session(
         let elapsed = window_start.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let hz = pkts as f32 / (elapsed.as_millis() as f32 / 1000.0);
+            let TxStats { sent, queue_full, timesync, max_age_ms, uart_rx_errors } = tx_stats();
+            let step = frame_step.unwrap_or(0);
             match last_pose.take() {
                 Some(rb) => info!(
-                    "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | body {}: pos [{:.1} {:.1} {:.1}] mm valid={}",
+                    "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | missed {missed} (frame step {step}), dup {dup} | sent {sent}, queue full {queue_full}, age max {max_age_ms} ms | timesync {timesync}, uart rx err {uart_rx_errors} | body {}: pos [{:.1} {:.1} {:.1}] mm valid={}",
                     s.rigid_body_id, rb.pos[0], rb.pos[1], rb.pos[2], rb.valid
                 ),
                 None => info!(
-                    "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | body {} not seen",
+                    "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | missed {missed} (frame step {step}), dup {dup} | sent {sent}, queue full {queue_full}, age max {max_age_ms} ms | timesync {timesync}, uart rx err {uart_rx_errors} | body {} not seen",
                     s.rigid_body_id
                 ),
             }
+            missed = 0;
+            dup = 0;
             pkts = 0;
             window_start = Instant::now();
         }
