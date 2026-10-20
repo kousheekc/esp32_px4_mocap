@@ -17,7 +17,3 @@ pub const EXTERNAL_ANTENNA: bool = true;
 pub const QTM_UDP_PORT: u16 = 22230;
 /// Re-request streaming after this long without a QTM frame
 pub const QTM_SILENCE_MS: u64 = 3000;
-
-/// TEST ONLY: added to every VISION_POSITION_ESTIMATE timestamp so the EV delay estimate can be
-/// checked against a known offset. Must be 0 for flight, or EKF2 fuses vision at the wrong time.
-pub const TEST_TIMESTAMP_SHIFT_US: u64 = 50_000;

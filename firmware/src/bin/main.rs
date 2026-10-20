@@ -237,12 +237,6 @@ async fn run_bridge(s: &'static Settings, mut uart: UartTx<'static, Async>) -> !
     let mut reset_counter: u8 = 0;
 
     let mut heartbeat = Ticker::every(Duration::from_hz(u64::from(s.heartbeat_rate_hz)));
-    if config::TEST_TIMESTAMP_SHIFT_US != 0 {
-        warn!(
-            "TEST: VPE timestamps shifted by +{} ms, set TEST_TIMESTAMP_SHIFT_US = 0 before flying",
-            config::TEST_TIMESTAMP_SHIFT_US / 1000
-        );
-    }
 
     loop {
         let tracking_deadline = async {
@@ -293,7 +287,7 @@ async fn run_bridge(s: &'static Settings, mut uart: UartTx<'static, Async>) -> !
                 MAX_AGE_US.fetch_max(age_us.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
                 let n = encoder.vision_position_estimate(
                     &mut buf,
-                    rb.capture_us + config::TEST_TIMESTAMP_SHIFT_US,
+                    rb.capture_us,
                     ned.pos[0],
                     ned.pos[1],
                     ned.pos[2],
