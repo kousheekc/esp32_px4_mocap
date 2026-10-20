@@ -16,10 +16,10 @@
 // In BOTH modes, holding BOOT (GPIO9) for 3 s erases settings and reboots back into the portal.
 
 use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{select3, select4, Either3, Either4};
+use embassy_futures::select::{select, select3, select4, Either, Either3, Either4};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{
@@ -32,7 +32,7 @@ use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_io_async::{Read as _, Write as _};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, InputConfig, Pull};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, RxConfig, Uart, UartRx, UartTx};
@@ -64,6 +64,8 @@ static TIMESYNC_SENT: AtomicU32 = AtomicU32::new(0);
 static MAX_AGE_US: AtomicU32 = AtomicU32::new(0);
 /// UART RX errors (mostly FIFO overflows) since the last stats line.
 static UART_RX_ERRORS: AtomicU32 = AtomicU32::new(0);
+/// Latest station RSSI in dBm, sampled by the WiFi task; 0 while disconnected.
+static RSSI_DBM: AtomicI32 = AtomicI32::new(0);
 
 fn publish(sample: Sample) {
     if POSES.try_send(sample).is_err() {
@@ -127,6 +129,16 @@ async fn main(spawner: Spawner) -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
     spawner.spawn(button::factory_reset_task(boot_button, store).expect("button task"));
+
+    // XIAO ESP32-C6 RF switch: GPIO3 LOW enables it, GPIO14 picks the antenna (HIGH = U.FL).
+    // Held for the life of main, which never returns.
+    let _rf_switch_en = Output::new(peripherals.GPIO3, Level::Low, OutputConfig::default());
+    let ant_sel = if config::EXTERNAL_ANTENNA { Level::High } else { Level::Low };
+    let _ant_sel = Output::new(peripherals.GPIO14, ant_sel, OutputConfig::default());
+    info!(
+        "antenna: {}",
+        if config::EXTERNAL_ANTENNA { "external (U.FL)" } else { "onboard ceramic" }
+    );
 
     // WiFi + network stack
     let (mut controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, Default::default())
@@ -225,6 +237,12 @@ async fn run_bridge(s: &'static Settings, mut uart: UartTx<'static, Async>) -> !
     let mut reset_counter: u8 = 0;
 
     let mut heartbeat = Ticker::every(Duration::from_hz(u64::from(s.heartbeat_rate_hz)));
+    if config::TEST_TIMESTAMP_SHIFT_US != 0 {
+        warn!(
+            "TEST: VPE timestamps shifted by +{} ms, set TEST_TIMESTAMP_SHIFT_US = 0 before flying",
+            config::TEST_TIMESTAMP_SHIFT_US / 1000
+        );
+    }
 
     loop {
         let tracking_deadline = async {
@@ -275,7 +293,7 @@ async fn run_bridge(s: &'static Settings, mut uart: UartTx<'static, Async>) -> !
                 MAX_AGE_US.fetch_max(age_us.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
                 let n = encoder.vision_position_estimate(
                     &mut buf,
-                    rb.capture_us,
+                    rb.capture_us + config::TEST_TIMESTAMP_SHIFT_US,
                     ned.pos[0],
                     ned.pos[1],
                     ned.pos[2],
@@ -341,7 +359,21 @@ async fn wifi_task(mut controller: WifiController<'static>, s: &'static Settings
         match controller.connect_async().await {
             Ok(_) => {
                 info!("wifi: connected");
-                let info = controller.wait_for_disconnect_async().await;
+                // Sample RSSI for the stats lines until the link drops.
+                let sample_rssi = async {
+                    let mut ticker = Ticker::every(Duration::from_secs(1));
+                    loop {
+                        if let Ok(rssi) = controller.rssi() {
+                            RSSI_DBM.store(rssi, Ordering::Relaxed);
+                        }
+                        ticker.next().await;
+                    }
+                };
+                let info = match select(controller.wait_for_disconnect_async(), sample_rssi).await {
+                    Either::First(info) => info,
+                    Either::Second(never) => never,
+                };
+                RSSI_DBM.store(0, Ordering::Relaxed);
                 warn!("wifi: disconnected ({info:?}), reconnecting");
             }
             Err(e) => {
@@ -409,14 +441,15 @@ async fn natnet_rx_task(stack: Stack<'static>, s: &'static Settings) -> ! {
         if elapsed >= Duration::from_secs(1) {
             let hz = pkts as f32 / (elapsed.as_millis() as f32 / 1000.0);
             let TxStats { sent, queue_full, timesync, uart_rx_errors, .. } = tx_stats();
+            let rssi = RSSI_DBM.load(Ordering::Relaxed);
             match last_pose.take() {
                 Some(rb) => info!(
-                    "natnet: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | sent {sent}, queue full {queue_full}, timesync {timesync}, uart rx err {uart_rx_errors} | rb{}: pos [{:.3} {:.3} {:.3}] quat [{:.3} {:.3} {:.3} {:.3}] valid={}",
+                    "natnet: {pkts} pkts ({hz:.1} Hz, last {last_len} B, rssi {rssi} dBm) | sent {sent}, queue full {queue_full}, timesync {timesync}, uart rx err {uart_rx_errors} | rb{}: pos [{:.3} {:.3} {:.3}] quat [{:.3} {:.3} {:.3} {:.3}] valid={}",
                     rb.id, rb.pos[0], rb.pos[1], rb.pos[2],
                     rb.quat[0], rb.quat[1], rb.quat[2], rb.quat[3], rb.valid
                 ),
                 None => info!(
-                    "natnet: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | sent {sent}, queue full {queue_full}, timesync {timesync}, uart rx err {uart_rx_errors} | rb{} not seen",
+                    "natnet: {pkts} pkts ({hz:.1} Hz, last {last_len} B, rssi {rssi} dBm) | sent {sent}, queue full {queue_full}, timesync {timesync}, uart rx err {uart_rx_errors} | rb{} not seen",
                     s.rigid_body_id
                 ),
             }
@@ -597,14 +630,15 @@ async fn qtm_session(
         if elapsed >= Duration::from_secs(1) {
             let hz = pkts as f32 / (elapsed.as_millis() as f32 / 1000.0);
             let TxStats { sent, queue_full, timesync, max_age_ms, uart_rx_errors } = tx_stats();
+            let rssi = RSSI_DBM.load(Ordering::Relaxed);
             let step = frame_step.unwrap_or(0);
             match last_pose.take() {
                 Some(rb) => info!(
-                    "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | missed {missed} (frame step {step}), dup {dup} | sent {sent}, queue full {queue_full}, age max {max_age_ms} ms | timesync {timesync}, uart rx err {uart_rx_errors} | body {}: pos [{:.1} {:.1} {:.1}] mm valid={}",
+                    "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B, rssi {rssi} dBm) | missed {missed} (frame step {step}), dup {dup} | sent {sent}, queue full {queue_full}, age max {max_age_ms} ms | timesync {timesync}, uart rx err {uart_rx_errors} | body {}: pos [{:.1} {:.1} {:.1}] mm valid={}",
                     s.rigid_body_id, rb.pos[0], rb.pos[1], rb.pos[2], rb.valid
                 ),
                 None => info!(
-                    "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B) | missed {missed} (frame step {step}), dup {dup} | sent {sent}, queue full {queue_full}, age max {max_age_ms} ms | timesync {timesync}, uart rx err {uart_rx_errors} | body {} not seen",
+                    "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B, rssi {rssi} dBm) | missed {missed} (frame step {step}), dup {dup} | sent {sent}, queue full {queue_full}, age max {max_age_ms} ms | timesync {timesync}, uart rx err {uart_rx_errors} | body {} not seen",
                     s.rigid_body_id
                 ),
             }
