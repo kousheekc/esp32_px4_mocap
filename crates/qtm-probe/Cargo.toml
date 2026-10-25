@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+frames = { path = "../frames" }
 qtmrt = { path = "../qtmrt" }
 
 clap = { version = "4.6.7", features = ["derive"] }
 ctrlc = "3.5.2"
 socket2 = "0.6.5"
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.5"
