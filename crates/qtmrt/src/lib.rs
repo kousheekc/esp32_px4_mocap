@@ -186,6 +186,75 @@ impl ClockSync {
     }
 }
 
+/// Frame bookkeeping for one QTM stream: drops duplicates, counts missed frames and maps each new
+/// frame's capture time onto the local clock.
+///
+/// QTM frame numbers count camera frames, so the normal step is capture rate / stream rate. The
+/// smallest step seen is taken as normal and anything larger counts as missed frames.
+pub struct FrameTracker {
+    clock: ClockSync,
+    last_frame: Option<u32>,
+    frame_step: Option<u32>,
+    missed: u32,
+    dup: u32,
+}
+
+/// Missed and duplicate frames since the last [`FrameTracker::take_counts`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameCounts {
+    pub missed: u32,
+    pub dup: u32,
+}
+
+impl FrameTracker {
+    /// `clock_window_us` is passed to [`ClockSync::new`]
+    pub const fn new(clock_window_us: u64) -> Self {
+        Self {
+            clock: ClockSync::new(clock_window_us),
+            last_frame: None,
+            frame_step: None,
+            missed: 0,
+            dup: 0,
+        }
+    }
+
+    /// Feed one Data packet; returns its capture time on the local clock, or `None` if it's a
+    /// duplicate to be dropped
+    pub fn update(&mut self, hdr: DataHeader, arrival_us: u64) -> Option<u64> {
+        // Sessions QTM still holds from before a bridge reset stream the same frames to this port
+        // again, so only frames newer than the last one are fresh.
+        match self.last_frame.map(|prev| hdr.frame.wrapping_sub(prev) as i32) {
+            Some(d) if (-1000..=0).contains(&d) => {
+                self.dup += 1;
+                return None;
+            }
+            Some(d) if d > 0 && d < 100_000 => {
+                let step = d as u32;
+                let normal = self.frame_step.map_or(step, |n| n.min(step));
+                self.frame_step = Some(normal);
+                self.missed += (step / normal).saturating_sub(1);
+            }
+            // First frame, or QTM restarted the measurement.
+            _ => {}
+        }
+        self.last_frame = Some(hdr.frame);
+        Some(self.clock.update(hdr.timestamp_us, arrival_us))
+    }
+
+    /// Normal frame step, 0 until two frames have been seen
+    pub fn frame_step(&self) -> u32 {
+        self.frame_step.unwrap_or(0)
+    }
+
+    /// Counts since the last call, resetting them
+    pub fn take_counts(&mut self) -> FrameCounts {
+        let c = FrameCounts { missed: self.missed, dup: self.dup };
+        self.missed = 0;
+        self.dup = 0;
+        c
+    }
+}
+
 /// Parse a Data packet payload, returning the 6D body at `index` (0-based), or `None` if it's
 /// malformed, has no 6D component, or has fewer bodies
 pub fn parse_6d(payload: &[u8], index: usize) -> Option<Body> {
@@ -341,6 +410,52 @@ mod tests {
         assert_eq!(cs.update(3_010_000, 4_015_000), 3_010_000 + 1_005_000);
         // QTM restarts the measurement: timestamps start over.
         assert_eq!(cs.update(0, 9_000_000), 9_000_000);
+    }
+
+    fn hdr(frame: u32) -> DataHeader {
+        DataHeader { timestamp_us: frame as u64 * 1_000, frame }
+    }
+
+    #[test]
+    fn frame_tracker_counts_missed_frames() {
+        let mut ft = FrameTracker::new(1_000_000);
+        assert_eq!(ft.frame_step(), 0);
+        // Step 10, then frames 30 and 40 lost.
+        for f in [10, 20, 50, 60] {
+            assert!(ft.update(hdr(f), 1_000_000 + f as u64 * 1_000).is_some());
+        }
+        assert_eq!(ft.frame_step(), 10);
+        assert_eq!(ft.take_counts(), FrameCounts { missed: 2, dup: 0 });
+        assert_eq!(ft.take_counts(), FrameCounts::default());
+    }
+
+    #[test]
+    fn frame_tracker_drops_duplicates() {
+        let mut ft = FrameTracker::new(1_000_000);
+        ft.update(hdr(100), 1_100_000);
+        ft.update(hdr(101), 1_101_000);
+        // An old session replaying earlier frames.
+        assert_eq!(ft.update(hdr(101), 1_102_000), None);
+        assert_eq!(ft.update(hdr(50), 1_103_000), None);
+        assert!(ft.update(hdr(102), 1_104_000).is_some());
+        assert_eq!(ft.take_counts(), FrameCounts { missed: 0, dup: 2 });
+    }
+
+    #[test]
+    fn frame_tracker_restart_and_wrap() {
+        let mut ft = FrameTracker::new(1_000_000);
+        ft.update(hdr(500_000), 1_000_000);
+        // QTM restarted the measurement: big backwards jump is a new stream, not missed or dup.
+        assert!(ft.update(hdr(1), 2_000_000).is_some());
+        assert_eq!(ft.take_counts(), FrameCounts::default());
+
+        // Frame counter wrapping past u32::MAX is still a step of 1.
+        let mut ft = FrameTracker::new(1_000_000);
+        ft.update(hdr(u32::MAX - 1), 1_000_000);
+        ft.update(hdr(u32::MAX), 1_001_000);
+        assert!(ft.update(DataHeader { timestamp_us: 0, frame: 0 }, 1_002_000).is_some());
+        assert_eq!(ft.take_counts(), FrameCounts::default());
+        assert_eq!(ft.frame_step(), 1);
     }
 
     #[test]

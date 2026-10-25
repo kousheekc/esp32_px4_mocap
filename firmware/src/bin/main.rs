@@ -540,13 +540,7 @@ async fn qtm_session(
     let mut pkts: u32 = 0;
     let mut last_len = 0usize;
     let mut last_pose: Option<qtmrt::Body> = None;
-    // QTM frame numbers count camera frames, so the normal step is capture rate / stream rate.
-    // Take the smallest step seen as normal and count anything larger as missed frames.
-    let mut last_frame: Option<u32> = None;
-    let mut frame_step: Option<u32> = None;
-    let mut missed: u32 = 0;
-    let mut dup: u32 = 0;
-    let mut clock = qtmrt::ClockSync::new(1_000_000);
+    let mut frames = qtmrt::FrameTracker::new(1_000_000);
 
     loop {
         match select3(
@@ -579,34 +573,17 @@ async fn qtm_session(
                 let Some(hdr) = qtmrt::data_header(p.payload) else {
                     continue;
                 };
-                // Sessions QTM still holds from before a bridge reset stream the same frames to
-                // this port again, so only forward frames newer than the last one.
-                let fresh = match last_frame.map(|prev| hdr.frame.wrapping_sub(prev) as i32) {
-                    Some(d) if (-1000..=0).contains(&d) => false,
-                    Some(d) if d > 0 && d < 100_000 => {
-                        let step = d as u32;
-                        let normal = frame_step.map_or(step, |n| n.min(step));
-                        frame_step = Some(normal);
-                        missed += (step / normal).saturating_sub(1);
-                        true
-                    }
-                    // First frame, or QTM restarted the measurement.
-                    _ => true,
-                };
-                if !fresh {
-                    dup += 1;
-                } else {
-                    last_frame = Some(hdr.frame);
-                    let capture_us = clock.update(hdr.timestamp_us, arrival.as_micros());
-                    if let Some(rb) = qtmrt::parse_6d(p.payload, index) {
-                        publish(Sample {
-                            pos: rb.pos.map(|v| v * 1e-3),
-                            quat_xyzw: rotmat_to_quat_xyzw(rb.rot),
-                            valid: rb.valid,
-                            capture_us,
-                        });
-                        last_pose = Some(rb);
-                    }
+                // Duplicates fall through so the stats line still prints.
+                if let Some(capture_us) = frames.update(hdr, arrival.as_micros())
+                    && let Some(rb) = qtmrt::parse_6d(p.payload, index)
+                {
+                    publish(Sample {
+                        pos: rb.pos.map(|v| v * 1e-3),
+                        quat_xyzw: rotmat_to_quat_xyzw(rb.rot),
+                        valid: rb.valid,
+                        capture_us,
+                    });
+                    last_pose = Some(rb);
                 }
             }
             Either3::Second(Err(e)) => warn!("qtm: recv error {e:?}"),
@@ -625,7 +602,8 @@ async fn qtm_session(
             let hz = pkts as f32 / (elapsed.as_millis() as f32 / 1000.0);
             let TxStats { sent, queue_full, timesync, max_age_ms, uart_rx_errors } = tx_stats();
             let rssi = RSSI_DBM.load(Ordering::Relaxed);
-            let step = frame_step.unwrap_or(0);
+            let step = frames.frame_step();
+            let qtmrt::FrameCounts { missed, dup } = frames.take_counts();
             match last_pose.take() {
                 Some(rb) => info!(
                     "qtm: {pkts} pkts ({hz:.1} Hz, last {last_len} B, rssi {rssi} dBm) | missed {missed} (frame step {step}), dup {dup} | sent {sent}, queue full {queue_full}, age max {max_age_ms} ms | timesync {timesync}, uart rx err {uart_rx_errors} | body {}: pos [{:.1} {:.1} {:.1}] mm valid={}",
@@ -636,8 +614,6 @@ async fn qtm_session(
                     s.rigid_body_id
                 ),
             }
-            missed = 0;
-            dup = 0;
             pkts = 0;
             window_start = Instant::now();
         }

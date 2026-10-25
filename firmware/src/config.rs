@@ -11,7 +11,7 @@ pub const RESET_HOLD_MS: u64 = 3000;
 
 /// Use the U.FL antenna port instead of the onboard ceramic antenna. Only enable with an antenna
 /// plugged in, an empty U.FL port leaves almost no link.
-pub const EXTERNAL_ANTENNA: bool = true;
+pub const EXTERNAL_ANTENNA: bool = false;
 
 /// Local UDP port QTM streams frames to
 pub const QTM_UDP_PORT: u16 = 22230;
